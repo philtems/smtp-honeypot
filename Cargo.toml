@@ -1,0 +1,32 @@
+[package]
+name = "smtp-honeypot"
+version = "0.1.0"
+authors = ["2026, Philippe TEMESI"]
+description = "A SMTP honeypot for detecting and analyzing SMTP attacks"
+repository = "https://www.tems.be"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.0", features = ["full"] }
+structopt = "0.3"
+chrono = "0.4"
+anyhow = "1.0"
+rustls = "0.21"
+rustls-pemfile = "1.0"
+tokio-rustls = "0.24"
+
+openssl = { version = "0.10", features = ["vendored"] }
+
+[target.'cfg(unix)'.dependencies]
+daemonize = "0.5.0"
+libc = "0.2"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+split-debuginfo = "packed"
+strip = "symbols"
+incremental = true
+
