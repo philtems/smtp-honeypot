@@ -244,7 +244,7 @@ impl SmtpHoneypot {
         let (reader, mut writer) = tokio::io::split(stream);
         let mut reader = BufReader::new(reader);
         
-        let banner = format!("220 {} SMTP Honeypot (TLS)\r\n", self.opt.helo);
+        let banner = format!("220 {} SMTP (TLS)\r\n", self.opt.helo);
         writer.write_all(banner.as_bytes()).await?;
         
         let mut line = String::new();
@@ -311,7 +311,7 @@ impl SmtpHoneypot {
         let (reader, mut writer) = tokio::io::split(stream);
         let mut reader = BufReader::new(reader);
         
-        let banner = format!("220 {} SMTP Honeypot\r\n", self.opt.helo);
+        let banner = format!("220 {} SMTP \r\n", self.opt.helo);
         writer.write_all(banner.as_bytes()).await?;
         
         let mut line = String::new();
