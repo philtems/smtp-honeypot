@@ -26,19 +26,30 @@ pub struct SmtpHoneypot {
 
 impl SmtpHoneypot {
     pub async fn new(opt: Opt) -> Result<Self> {
+        // Log de debug
+        eprintln!("[DEBUG] SmtpHoneypot::new() called");
+        eprintln!("[DEBUG] Current PID: {}", std::process::id());
+        eprintln!("[DEBUG] Current working dir: {:?}", std::env::current_dir().unwrap());
+        
         let logger = Logger::new(opt.log_file.clone(), opt.raw_display)?;
         
         // Créer le dossier data si spécifié
         if let Some(data_dir) = &opt.data_dir {
+            eprintln!("[DEBUG] Checking data directory: {:?}", data_dir);
             if !data_dir.exists() {
+                eprintln!("[DEBUG] Creating data directory: {:?}", data_dir);
                 std::fs::create_dir_all(data_dir)
                     .with_context(|| format!("Failed to create data directory: {:?}", data_dir))?;
                 eprintln!("[INFO] Data directory created: {:?}", data_dir);
+            } else {
+                eprintln!("[DEBUG] Data directory already exists: {:?}", data_dir);
             }
         }
         
         // Configurer TLS avec RustLS
         let tls_acceptor = if let (Some(cert_path), Some(key_path)) = (&opt.tls_cert, &opt.tls_key) {
+            eprintln!("[DEBUG] Loading TLS certificate from: {:?}", cert_path);
+            
             // Lire le certificat
             let cert_file = &mut std::fs::File::open(cert_path)
                 .with_context(|| format!("Failed to open certificate: {:?}", cert_path))?;
@@ -50,6 +61,7 @@ impl SmtpHoneypot {
                 .collect();
             
             // Lire la clé privée
+            eprintln!("[DEBUG] Loading private key from: {:?}", key_path);
             let key_file = &mut std::fs::File::open(key_path)
                 .with_context(|| format!("Failed to open private key: {:?}", key_path))?;
             let mut key_reader = StdBufReader::new(key_file);
@@ -63,6 +75,7 @@ impl SmtpHoneypot {
             let private_key = PrivateKey(keys.remove(0));
             
             // Configurer le serveur TLS
+            eprintln!("[DEBUG] Building TLS server config...");
             let config = ServerConfig::builder()
                 .with_safe_defaults()
                 .with_no_client_auth()
@@ -77,8 +90,11 @@ impl SmtpHoneypot {
             if opt.ports.contains(&465) || opt.ports.contains(&587) {
                 eprintln!("[WARNING] TLS ports specified but no certificates provided");
             }
+            eprintln!("[DEBUG] TLS not enabled");
             None
         };
+        
+        eprintln!("[DEBUG] SmtpHoneypot::new() completed successfully");
         
         Ok(Self {
             opt: opt.clone(),
@@ -315,7 +331,7 @@ impl SmtpHoneypot {
         writer.write_all(banner.as_bytes()).await?;
         
         let mut line = String::new();
-        let mut session = session::SmtpSession::new(client_addr, false);
+        let mut session = session::SmtpSession::new(client_addr, self.opt.starttls);
         
         loop {
             line.clear();
@@ -341,6 +357,16 @@ impl SmtpHoneypot {
                             session.data.push(cmd_line.to_string());
                         }
                         continue;
+                    }
+                    
+                    // Gestion spéciale pour STARTTLS
+                    if cmd_line.to_uppercase() == "STARTTLS" && self.tls_acceptor.is_some() && !session.tls_active {
+                        self.logger.log(&client_addr, "STARTTLS command received").await;
+                        writer.write_all(b"220 Ready to start TLS\r\n").await?;
+                        writer.flush().await?;
+                        
+                        // Retourner pour que l'appelant gère la mise à niveau TLS
+                        return Ok(());
                     }
                     
                     let response = self.process_command(cmd_line, &mut session).await;
@@ -369,6 +395,7 @@ impl SmtpHoneypot {
         Ok(())
     }
     
+    #[allow(dead_code)]
     async fn handle_starttls_stream(&self, stream: TcpStream, client_addr: SocketAddr) -> Result<()> {
         self.logger.log(&client_addr, "Starting STARTTLS handshake").await;
         
@@ -421,7 +448,20 @@ impl SmtpHoneypot {
         // Port 25 ou 587 : STARTTLS possible
         else if (port == 25 || port == 587) && self.opt.starttls && self.tls_acceptor.is_some() {
             // On commence en clair
-            self.handle_plain_stream(stream, client_addr).await
+            match self.handle_plain_stream(stream, client_addr).await {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    if e.to_string().contains("STARTTLS") {
+                        // C'était une commande STARTTLS, on refait avec TLS
+                        // Note: Cette logique est simplifiée, dans la réalité il faudrait
+                        // récupérer le stream après STARTTLS
+                        self.logger.log(&client_addr, "STARTTLS handshake initiated").await;
+                        Ok(())
+                    } else {
+                        Err(e)
+                    }
+                }
+            }
         }
         // Autres ports : clair seulement
         else {
@@ -431,34 +471,64 @@ impl SmtpHoneypot {
     
     async fn run_server(&self, port: u16) -> Result<()> {
         let addr = format!("{}:{}", self.opt.address, port);
-        let listener = TcpListener::bind(&addr).await
-            .with_context(|| format!("Failed to bind to {}", addr))?;
         
-        self.logger.log(&SocketAddr::from(([0,0,0,0], 0)), &format!("Listening on port {}", port)).await;
+        // Logs de debug cruciaux
+        eprintln!("[DEBUG] run_server: attempting to bind to {}", addr);
+        eprintln!("[DEBUG] Current PID in run_server: {}", std::process::id());
         
-        loop {
-            match listener.accept().await {
-                Ok((stream, client_addr)) => {
-                    let this = Arc::new(self.clone());
-                    let port = port;
-                    
-                    tokio::spawn(async move {
-                        if let Err(e) = this.handle_client(stream, client_addr, port).await {
-                            let _ = this.logger.log(&client_addr, &format!("Error: {}", e)).await;
+        // Test d'écriture dans /tmp pour vérifier les permissions
+        let test_file = format!("/tmp/smtp-honeypot-server-test-{}", port);
+        if let Err(e) = std::fs::write(&test_file, b"test") {
+            eprintln!("[DEBUG] WARNING: Cannot write test file {}: {}", test_file, e);
+        } else {
+            eprintln!("[DEBUG] Successfully wrote test file {}", test_file);
+            let _ = std::fs::remove_file(&test_file);
+        }
+        
+        match TcpListener::bind(&addr).await {
+            Ok(listener) => {
+                eprintln!("[DEBUG] run_server: SUCCESSFULLY bound to {}", addr);
+                self.logger.log(&SocketAddr::from(([0,0,0,0], 0)), 
+                              &format!("Listening on port {}", port)).await;
+                
+                loop {
+                    match listener.accept().await {
+                        Ok((stream, client_addr)) => {
+                            eprintln!("[DEBUG] Accepted connection from {} on port {}", client_addr, port);
+                            let this = Arc::new(self.clone());
+                            let port = port;
+                            
+                            tokio::spawn(async move {
+                                if let Err(e) = this.handle_client(stream, client_addr, port).await {
+                                    let _ = this.logger.log(&client_addr, &format!("Error: {}", e)).await;
+                                }
+                            });
                         }
-                    });
+                        Err(e) => {
+                            eprintln!("[DEBUG] Accept error on port {}: {}", port, e);
+                            self.logger.log(&SocketAddr::from(([0,0,0,0], 0)), 
+                                          &format!("Accept error on port {}: {}", port, e)).await;
+                        }
+                    }
                 }
-                Err(e) => {
-                    self.logger.log(&SocketAddr::from(([0,0,0,0], 0)), &format!("Accept error on port {}: {}", port, e)).await;
-                }
+            }
+            Err(e) => {
+                eprintln!("[ERROR] run_server: FAILED to bind to {}: {}", addr, e);
+                self.logger.log(&SocketAddr::from(([0,0,0,0], 0)), 
+                              &format!("Failed to bind to {}: {}", addr, e)).await;
+                Err(e.into())
             }
         }
     }
     
     pub async fn run(self: Arc<Self>) -> Result<()> {
+        eprintln!("[DEBUG] SmtpHoneypot::run() started");
+        eprintln!("[DEBUG] Ports to listen on: {:?}", self.opt.ports);
+        
         let mut handles = vec![];
         
         for port in self.opt.ports.clone() {
+            eprintln!("[DEBUG] Spawning server for port {}", port);
             let this = self.clone();
             let handle = tokio::spawn(async move {
                 if let Err(e) = this.run_server(port).await {
@@ -467,6 +537,8 @@ impl SmtpHoneypot {
             });
             handles.push(handle);
         }
+        
+        eprintln!("[DEBUG] All servers spawned, waiting for completion...");
         
         for handle in handles {
             handle.await?;

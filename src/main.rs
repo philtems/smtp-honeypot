@@ -2,7 +2,6 @@ mod utils;
 mod ratelimiter;
 mod session;
 mod honeypot;
-mod daemon;
 
 use structopt::StructOpt;
 use anyhow::Result;
@@ -93,53 +92,145 @@ async fn main() -> Result<()> {
     
     println!("==========================================");
     println!("SMTP Honeypot v{}", env!("CARGO_PKG_VERSION"));
-    println!("{}", env!("CARGO_PKG_AUTHORS"));
-    println!("{}", env!("CARGO_PKG_REPOSITORY"));
     println!("==========================================");
     
     eprintln!("[INFO] Starting as user: {}", 
               std::env::var("USER").unwrap_or_else(|_| "unknown".to_string()));
     eprintln!("[INFO] PID: {}", std::process::id());
+    eprintln!("[INFO] Working directory: {:?}", std::env::current_dir().unwrap());
     
-    // Mode daemon si demandé (AVANT de créer le honeypot)
+    // Vérifier/Créer les répertoires nécessaires AVANT daemonisation
+    if let Some(log_path) = &opt.log_file {
+        if let Some(parent) = log_path.parent() {
+            if !parent.exists() {
+                std::fs::create_dir_all(parent)?;
+                eprintln!("[INFO] Created log directory: {:?}", parent);
+            }
+        }
+    }
+    
+    if let Some(data_dir) = &opt.data_dir {
+        if !data_dir.exists() {
+            std::fs::create_dir_all(data_dir)?;
+            eprintln!("[INFO] Created data directory: {:?}", data_dir);
+        }
+    }
+    
+    // === DAEMONISATION DANS UN THREAD SÉPARÉ ===
     if opt.daemon {
-        daemon::daemonize(&opt)?;
-        // Petit délai pour laisser le temps au processus enfant de s'initialiser
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        eprintln!("[INFO] Starting daemon mode...");
+        
+        use tokio::sync::oneshot;
+        let (tx, rx) = oneshot::channel();
+        
+        // Cloner opt pour le mouvement dans le thread
+        let opt_clone = opt.clone();
+        
+        std::thread::spawn(move || {
+            use daemonize::Daemonize;
+            use std::fs;
+            
+            // Daemonisation
+            let daemonize = Daemonize::new()
+                .pid_file("/tmp/smtp-honeypot.pid")
+                .chown_pid_file(true)
+                .working_directory(".");  // Garde le répertoire courant
+            
+            match daemonize.start() {
+                Ok(_) => {
+                    // Dans le processus enfant
+                    let pid = std::process::id();
+                    
+                    // Écrire un fichier de test
+                    let _ = fs::write("/tmp/smtp-honeypot-daemon-test.txt", 
+                                      format!("Child process started at PID {}\n", pid));
+                    
+                    // Tester la création d'un socket simple
+                    use std::net::TcpListener;
+                    match TcpListener::bind("127.0.0.1:0") {
+                        Ok(_) => {
+                            let _ = fs::write("/tmp/smtp-honeypot-socket-test.txt", 
+                                             "Socket test successful\n");
+                        }
+                        Err(e) => {
+                            let _ = fs::write("/tmp/smtp-honeypot-socket-test.txt", 
+                                             format!("Socket test failed: {}\n", e));
+                        }
+                    }
+                    
+                    // Signaler au parent que la daemonisation a réussi
+                    let _ = tx.send(pid);
+                    
+                    // CRÉER UN NOUVEAU RUNTIME TOKIO DANS L'ENFANT
+                    let runtime = tokio::runtime::Runtime::new().unwrap();
+                    runtime.block_on(async {
+                        eprintln!("[INFO] Child process: creating honeypot...");
+                        
+                        match honeypot::SmtpHoneypot::new(opt_clone).await {
+                            Ok(h) => {
+                                let honeypot = Arc::new(h);
+                                eprintln!("[INFO] Child process: honeypot created successfully");
+                                eprintln!("[INFO] Child process: starting main loop...");
+                                
+                                if let Err(e) = honeypot.run().await {
+                                    eprintln!("[ERROR] Child process: server error: {}", e);
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("[ERROR] Child process: failed to create honeypot: {}", e);
+                            }
+                        }
+                    });
+                }
+                Err(e) => {
+                    eprintln!("[ERROR] Daemon startup failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        });
+        
+        // Attendre que le processus enfant signale qu'il est prêt
+        match rx.await {
+            Ok(pid) => {
+                eprintln!("[INFO] Daemon child process running (PID: {})", pid);
+                eprintln!("[INFO] Parent process exiting");
+                std::process::exit(0);
+            }
+            Err(_) => {
+                eprintln!("[ERROR] Daemon child failed to start");
+                std::process::exit(1);
+            }
+        }
     }
     
-    // Ajouter un flag pour savoir si on est en mode daemon
-    let is_daemon = opt.daemon;
+    // === MODE NORMAL (PAS DE DAEMON) ===
+    eprintln!("[INFO] Creating honeypot instance...");
     
-    let honeypot = Arc::new(honeypot::SmtpHoneypot::new(opt).await?);
+    let honeypot = match honeypot::SmtpHoneypot::new(opt).await {
+        Ok(h) => Arc::new(h),
+        Err(e) => {
+            eprintln!("[ERROR] Failed to create honeypot: {}", e);
+            std::process::exit(1);
+        }
+    };
     
-    if !is_daemon {
-        println!("[INFO] SMTP honeypot started in foreground");
-        println!("[INFO] Ports: {:?}", honeypot.opt.ports);
-        println!("[INFO] Domains: {:?}", honeypot.opt.domains);
-        println!("[INFO] Open relay mode: {}", honeypot.opt.open_relay);
-        if !honeypot.valid_mailboxes.is_empty() {
-            println!("[INFO] Valid mailboxes: {:?}", honeypot.valid_mailboxes);
-        }
-        if honeypot.tls_acceptor.is_some() {
-            println!("[INFO] TLS enabled");
-        }
-        if honeypot.opt.starttls {
-            println!("[INFO] STARTTLS enabled on port 25/587");
-        }
-        println!("[INFO] Max connections per minute per IP: {}", honeypot.opt.max_connections_per_minute);
-        println!("[INFO] Waiting for connections...");
-        println!("[INFO] Press Ctrl+C to stop");
-    } else {
-        eprintln!("[INFO] SMTP honeypot daemon started (PID: {})", std::process::id());
-        eprintln!("[INFO] PID file: /tmp/smtp-honeypot.pid");
-        if let Some(log) = &honeypot.opt.log_file {
-            eprintln!("[INFO] Log file: {:?}", log);
-        }
-        if let Some(data) = &honeypot.opt.data_dir {
-            eprintln!("[INFO] Data directory: {:?}", data);
-        }
+    println!("[INFO] SMTP honeypot started in foreground");
+    println!("[INFO] PID: {}", std::process::id());
+    println!("[INFO] Ports: {:?}", honeypot.opt.ports);
+    println!("[INFO] Domains: {:?}", honeypot.opt.domains);
+    println!("[INFO] Open relay mode: {}", honeypot.opt.open_relay);
+    if !honeypot.valid_mailboxes.is_empty() {
+        println!("[INFO] Valid mailboxes: {:?}", honeypot.valid_mailboxes);
     }
+    if honeypot.tls_acceptor.is_some() {
+        println!("[INFO] TLS enabled");
+    }
+    if honeypot.opt.starttls {
+        println!("[INFO] STARTTLS enabled on port 25/587");
+    }
+    println!("[INFO] Max connections per minute per IP: {}", honeypot.opt.max_connections_per_minute);
+    println!("[INFO] Waiting for connections...");
+    println!("[INFO] Press Ctrl+C to stop");
     
     honeypot.run().await?;
     
