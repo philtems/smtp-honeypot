@@ -97,28 +97,49 @@ async fn main() -> Result<()> {
     println!("{}", env!("CARGO_PKG_REPOSITORY"));
     println!("==========================================");
     
+    eprintln!("[INFO] Starting as user: {}", 
+              std::env::var("USER").unwrap_or_else(|_| "unknown".to_string()));
+    eprintln!("[INFO] PID: {}", std::process::id());
+    
+    // Mode daemon si demandé (AVANT de créer le honeypot)
     if opt.daemon {
-        daemon::daemonize()?;
+        daemon::daemonize(&opt)?;
+        // Petit délai pour laisser le temps au processus enfant de s'initialiser
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
+    
+    // Ajouter un flag pour savoir si on est en mode daemon
+    let is_daemon = opt.daemon;
     
     let honeypot = Arc::new(honeypot::SmtpHoneypot::new(opt).await?);
     
-    println!("[INFO] SMTP honeypot started");
-    println!("[INFO] Ports: {:?}", honeypot.opt.ports);
-    println!("[INFO] Domains: {:?}", honeypot.opt.domains);
-    println!("[INFO] Open relay mode: {}", honeypot.opt.open_relay);
-    if !honeypot.valid_mailboxes.is_empty() {
-        println!("[INFO] Valid mailboxes: {:?}", honeypot.valid_mailboxes);
+    if !is_daemon {
+        println!("[INFO] SMTP honeypot started in foreground");
+        println!("[INFO] Ports: {:?}", honeypot.opt.ports);
+        println!("[INFO] Domains: {:?}", honeypot.opt.domains);
+        println!("[INFO] Open relay mode: {}", honeypot.opt.open_relay);
+        if !honeypot.valid_mailboxes.is_empty() {
+            println!("[INFO] Valid mailboxes: {:?}", honeypot.valid_mailboxes);
+        }
+        if honeypot.tls_acceptor.is_some() {
+            println!("[INFO] TLS enabled");
+        }
+        if honeypot.opt.starttls {
+            println!("[INFO] STARTTLS enabled on port 25/587");
+        }
+        println!("[INFO] Max connections per minute per IP: {}", honeypot.opt.max_connections_per_minute);
+        println!("[INFO] Waiting for connections...");
+        println!("[INFO] Press Ctrl+C to stop");
+    } else {
+        eprintln!("[INFO] SMTP honeypot daemon started (PID: {})", std::process::id());
+        eprintln!("[INFO] PID file: /tmp/smtp-honeypot.pid");
+        if let Some(log) = &honeypot.opt.log_file {
+            eprintln!("[INFO] Log file: {:?}", log);
+        }
+        if let Some(data) = &honeypot.opt.data_dir {
+            eprintln!("[INFO] Data directory: {:?}", data);
+        }
     }
-    if honeypot.tls_acceptor.is_some() {
-        println!("[INFO] TLS enabled");
-    }
-    if honeypot.opt.starttls {
-        println!("[INFO] STARTTLS enabled on port 25/587");
-    }
-    println!("[INFO] Max connections per minute per IP: {}", honeypot.opt.max_connections_per_minute);
-    println!("[INFO] Waiting for connections...");
-    println!("[INFO] Press Ctrl+C to stop");
     
     honeypot.run().await?;
     
